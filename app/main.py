@@ -2,10 +2,16 @@ import os
 import time
 import json
 import shlex
+import logging
+from pathlib import Path
 from dotenv import load_dotenv
 from openai import OpenAI
 
-# Custom imports
+# 1. SILENCE LOGGING: Keeps the terminal clean
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("openai").setLevel(logging.WARNING)
+
+# Custom RAG & Voice Imports
 from rag.pdf_loader import load_all_pdfs_text
 from rag.image_reader import load_all_images_text
 from rag.chunker import chunk_text
@@ -15,231 +21,170 @@ from rag.retriever import retrieve_chunks
 from rag.prompt import build_prompt
 from rag.upload_manager import save_uploaded_files, build_temp_index, clear_tmp_dir
 from rag.actions import schedule_meeting 
-from voice.stt import record_audio
+from voice.stt import record_audio, cleanup_audio
 from voice.stt_openai import speech_to_text
 from voice.tts import speak_text
 
-# ENV Setup
+# CONFIGURATION
 load_dotenv()
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-if not OPENAI_API_KEY:
-    raise RuntimeError("OPENAI_API_KEY not found")
-
-client = OpenAI(api_key=OPENAI_API_KEY)
+client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
 # Define the Tool Schema
 TOOLS = [{
     "type": "function",
     "function": {
         "name": "schedule_meeting",
-        "description": "Saves a meeting request to the database after user confirmation.",
+        "description": "ONLY call this if the user EXPLICITLY asks to book a meeting.",
         "parameters": {
             "type": "object",
             "properties": {
-                "name": {"type": "string", "description": "Full name of the user"},
-                "email": {"type": "string", "description": "User email"},
-                "phone": {"type": "string", "description": "User phone number"}
+                "name": {"type": "string", "description": "User's full name"},
+                "email": {"type": "string", "description": "User's email"},
+                "phone": {"type": "string", "description": "User's phone number"}
             },
             "required": ["name", "email", "phone"]
         }
     }
 }]
 
-# PATHS
-BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-DATA_DIR = os.path.join(BASE_DIR, "data")
-PDF_DIR = os.path.join(DATA_DIR, "pdf")
-IMAGE_DIR = os.path.join(DATA_DIR, "images")
-TMP_UPLOAD_DIR = os.path.join(DATA_DIR, "tmp") 
+# PATHS & SESSION STATE
+BASE_DIR = Path(__file__).resolve().parent.parent
+DATA_DIR = BASE_DIR / "data"
+TMP_UPLOAD_DIR = DATA_DIR / "tmp"
 MAX_MEMORY_TURNS = 10
 
-# SESSION STATE
 conversation_history = []
 temp_index = None
 meeting_scheduled_in_session = False
+voice_output_enabled = False 
 
 # HELPER FUNCTIONS
 
-def embed_query(query: str):
-    return embed_texts([query])
-
 def show_history():
-    """Prints the current session conversation in a formatted table."""
+    """Displays the in-memory session history."""
     if not conversation_history:
-        print("\n📜 History is empty.")
+        print("\n History is empty for this session.")
         return
-    print("\n" + "="*60)
-    print(f"{'INDEX':<7} | {'SENDER':<10} | {'MESSAGE'}")
-    print("-" * 60)
+    print("\n" + "="*70)
+    print(f"{'INDEX':<5} | {'SENDER':<8} | {'MESSAGE'}")
+    print("-" * 70)
     for i, turn in enumerate(conversation_history):
-        print(f"{i:<7} | {'User':<10} | {turn['user']}")
-        # Truncate bot answer for readability in table
-        bot_short = (turn['assistant'][:75] + '...') if len(turn['assistant']) > 75 else turn['assistant']
-        print(f"{' ': <7} | {'Bot':<10} | {bot_short}")
-    print("="*60 + "\n")
-
-def save_session_to_file():
-    """Saves the current conversation to a text file before exiting."""
-    if not conversation_history:
-        return
-    filename = f"chat_history_{int(time.time())}.txt"
-    with open(filename, "w", encoding="utf-8") as f:
-        f.write("BETOPIA CHAT SESSION HISTORY\n")
-        f.write("="*40 + "\n")
-        for turn in conversation_history:
-            f.write(f"USER: {turn['user']}\n")
-            f.write(f"BOT: {turn['assistant']}\n")
-            f.write("-" * 30 + "\n")
-    print(f"💾 History saved to {filename}")
+        print(f"{i:<5} | {'User':<8} | {turn['user']}")
+        bot_short = (turn['assistant'][:60] + '...') if len(turn['assistant']) > 60 else turn['assistant']
+        print(f"{' ': <5} | {'Bot':<8} | {bot_short}")
+    print("="*70 + "\n")
 
 # STARTUP LOGIC
-
-print("\n Loading PDFs...")
-pdf_docs = load_all_pdfs_text(PDF_DIR)
-print(" Loading images...")
-image_docs = load_all_images_text(IMAGE_DIR, client)
+print("\n Loading Knowledge Base Documents...")
+pdf_docs = load_all_pdfs_text(str(DATA_DIR / "pdf"))
+image_docs = load_all_images_text(str(DATA_DIR / "images"), client)
 
 documents = []
-timestamp = int(time.time())
+ts = int(time.time())
 
-for doc in pdf_docs:
-    documents.append({"text": doc["text"], "metadata": {"source": doc["source"], "type": "pdf", "updated_at": timestamp}})
-for doc in image_docs:
-    documents.append({"text": doc["text"], "metadata": {"source": doc["source"], "type": "image", "updated_at": timestamp}})
+for doc in pdf_docs + image_docs:
+    documents.append({"text": doc["text"], "metadata": {"source": doc["source"], "updated_at": ts}})
 
-if not documents:
-    print(" Warning: No documents found in data/ folder")
-else:
-    print(f" Loaded {len(pdf_docs)} PDFs and {len(image_docs)} images")
-
-print(" Chunking & Embedding...")
-chunks, metadatas = [], []
-for doc in documents:
-    doc_chunks = chunk_text(doc["text"])
-    chunks.extend(doc_chunks)
-    metadatas.extend([doc["metadata"]] * len(doc_chunks))
-
-if chunks:
-    vectors = embed_texts(chunks)
-    print(" Building FAISS index...")
-    index = create_faiss_index(vectors=vectors, texts=chunks, metadatas=metadatas)
+if documents:
+    chunks, metadatas = [], []
+    for doc in documents:
+        doc_chunks = chunk_text(doc["text"])
+        chunks.extend(doc_chunks)
+        metadatas.extend([doc["metadata"]] * len(doc_chunks))
+    index = create_faiss_index(embed_texts(chunks), chunks, metadatas)
+    print(f" Loaded {len(pdf_docs)} PDFs and {len(image_docs)} images.")
 else:
     index = None
-    print(" Skipping FAISS: No text chunks found.")
 
 # MAIN INTERACTION LOOP
-print("\n🤖 Betopia AI Agent Ready")
-print("-" * 40)
+print("\n" + "="*50)
+print("🤖 BETOPIA AI AGENT ONLINE")
+print("="*50)
 print("COMMANDS:")
 print("• [Type Text] + Enter : Normal Chat")
 print("• [Empty Enter]      : Voice Input Mode")
+print("• /voice             : Toggle Text-to-Voice (On/Off)")
 print("• /history           : View session logs")
 print("• /upload <path>     : Add temp files")
 print("• /clear             : Delete temp uploads")
-print("• exit               : Save & Close")
-print("-" * 40)
+print("• exit               : Close Assistant")
+print("-" * 50)
 
 try:
     while True:
-        raw_input = input("You: ").strip()
+        raw_input = input("\nYou: ").strip()
         is_voice_mode = False
         user_input = raw_input
 
-        # 1. HANDLE VOICE & EXIT
+        # 1. INPUT PROCESSING
         if raw_input == "":
             is_voice_mode = True
             audio_path = record_audio()
             user_input = speech_to_text(client, audio_path)
-            if not user_input or len(user_input.strip()) < 2: 
-                continue
-            print(f"🗣️ You said: {user_input}")
+            cleanup_audio(audio_path) 
+            if not user_input or len(user_input.strip()) < 2: continue
+            print(f"🗣️  You said: {user_input}")
 
         if user_input.lower() == "exit":
-            save_session_to_file()
+            print("\n👋 Goodbye! Thanks for chatting with Betopia.")
             break
 
-        # 2. HANDLE COMMANDS
+        # 2. COMMAND HANDLING
+        if user_input.lower() == "/voice":
+            voice_output_enabled = not voice_output_enabled
+            print(f"🔊 Text-to-Voice: {'ENABLED' if voice_output_enabled else 'DISABLED'}")
+            continue
+
         if user_input.lower() == "/history":
             show_history()
             continue
 
         if user_input.lower() == "/clear":
-            clear_tmp_dir(TMP_UPLOAD_DIR)
+            clear_tmp_dir(str(TMP_UPLOAD_DIR))
             temp_index = None
-            print(" All temporary uploads and their indices have been deleted.")
+            print("🧹 Temporary files cleared.")
             continue
 
         if user_input.startswith("/upload"):
             try:
                 paths = shlex.split(user_input)[1:]
-                clean_paths = [p.strip('"').replace("\\", "/") for p in paths]
-                save_uploaded_files(TMP_UPLOAD_DIR, clean_paths)
-                temp_index = build_temp_index(TMP_UPLOAD_DIR, client)
-                print(" Knowledge Base updated with uploaded files.")
+                save_uploaded_files(str(TMP_UPLOAD_DIR), paths)
+                temp_index = build_temp_index(str(TMP_UPLOAD_DIR), client)
+                print("✨ Temp index updated.")
             except Exception as e:
-                print(f" Upload Error: {e}")
+                print(f" Error: {e}")
             continue
 
-        # 3. RAG RETRIEVAL
+        # 3. AI AGENT LOGIC (RAG + Tools)
         retrieved = []
         if index:
-            retrieved = retrieve_chunks(user_input, index, embed_query, top_k=5)
-        
+            retrieved.extend(retrieve_chunks(user_input, index, lambda x: embed_texts([x]), top_k=5))
         if temp_index:
-            retrieved_tmp = retrieve_chunks(user_input, temp_index, embed_query, top_k=3)
-            retrieved.extend(retrieved_tmp)
+            retrieved.extend(retrieve_chunks(user_input, temp_index, lambda x: embed_texts([x]), top_k=3))
         
         context = "\n\n".join(r["text"] for r in retrieved)
         history_pairs = [(h["user"], h["assistant"]) for h in conversation_history]
-        
-        # 4. AGENT LLM CALL 
-        # Pass meeting_scheduled_in_session to build_prompt to update the AI's behavior
         prompt = build_prompt(context, user_input, history_pairs, meeting_status=meeting_scheduled_in_session)
-        messages = [{"role": "user", "content": prompt}]
         
-        response = client.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=messages,
-            tools=TOOLS,
-            tool_choice="auto",
-            temperature=0
-        )
-
-        response_message = response.choices[0].message
-        tool_calls = response_message.tool_calls
-
-        # 5. HANDLE AGENT ACTIONS
-        if tool_calls:
-            messages.append(response_message)
-            for tool_call in tool_calls:
-                function_args = json.loads(tool_call.function.arguments)
-                
-                # Execute tool: This now saves to meetings.json via actions.py
-                action_result = schedule_meeting(
-                    name=function_args.get("name"),
-                    email=function_args.get("email"),
-                    phone=function_args.get("phone")
-                )
-                
-                # If tool succeeds, lock the session so it doesn't ask again
-                if "SUCCESS" in action_result:
-                    meeting_scheduled_in_session = True
-
-                messages.append({
-                    "tool_call_id": tool_call.id,
-                    "role": "tool",
-                    "name": "schedule_meeting",
-                    "content": action_result,
-                })
-
-            second_response = client.chat.completions.create(model="gpt-4o-mini", messages=messages)
-            answer = second_response.choices[0].message.content
+        messages = [{"role": "user", "content": prompt}]
+        response = client.chat.completions.create(model="gpt-4o-mini", messages=messages, tools=TOOLS, tool_choice="auto")
+        resp_msg = response.choices[0].message
+        
+        if resp_msg.tool_calls:
+            messages.append(resp_msg)
+            for tool_call in resp_msg.tool_calls:
+                args = json.loads(tool_call.function.arguments)
+                action_result = schedule_meeting(**args)
+                if "SUCCESS" in action_result: meeting_scheduled_in_session = True
+                messages.append({"tool_call_id": tool_call.id, "role": "tool", "name": "schedule_meeting", "content": action_result})
+            final_resp = client.chat.completions.create(model="gpt-4o-mini", messages=messages)
+            answer = final_resp.choices[0].message.content
         else:
-            answer = response_message.content
+            answer = resp_msg.content
 
-        # 6. OUTPUT & SAVE
+        # 4. OUTPUT
         print(f"\n🤖 Bot: {answer}")
-        if is_voice_mode: 
+        if is_voice_mode or voice_output_enabled: 
             speak_text(client, answer)
         
         print("-" * 60)
@@ -248,6 +193,6 @@ try:
             conversation_history.pop(0)
 
 except KeyboardInterrupt:
-    print("\n👋 System Offline.")
-finally:
-    clear_tmp_dir(TMP_UPLOAD_DIR)
+    print("\n👋Session ended. Goodbye!")
+# finally:
+#     clear_tmp_dir(str(TMP_UPLOAD_DIR))
